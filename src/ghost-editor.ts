@@ -1,0 +1,146 @@
+import { CustomEditor, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { matchesKey, truncateToWidth, visibleWidth, type TUI } from "@earendil-works/pi-tui";
+import { injectGhostTextIntoLine } from "./ghost-render.ts";
+
+const GHOST_FACTORY_FLAG = Symbol.for("pi-nexp:ghost-editor-factory");
+const GHOST_INSTANCE_FLAG = Symbol.for("pi-nexp:ghost-editor-instance");
+
+export interface GhostEditorController {
+	ensureInstalled(ctx: ExtensionContext): void;
+	setGhostText(text: string): void;
+	clearGhostText(): void;
+	getGhostText(): string;
+	reset(): void;
+}
+
+interface WrappableEditor {
+	[GHOST_INSTANCE_FLAG]?: boolean;
+	paddingX?: number;
+	render(width: number): string[];
+	handleInput(data: string): void;
+	getText(): string;
+	setText(text: string): void;
+	isShowingAutocomplete?(): boolean;
+}
+
+export function createGhostEditorController(onUserEdit: () => void): GhostEditorController {
+	let ghostText = "";
+	let activeTui: TUI | undefined;
+
+	const requestRender = () => {
+		activeTui?.requestRender();
+	};
+
+	const setGhostText = (text: string) => {
+		const next = text.trim();
+		if (ghostText === next) return;
+		ghostText = next;
+		requestRender();
+	};
+
+	const clearGhostText = () => {
+		if (!ghostText) return;
+		ghostText = "";
+		requestRender();
+	};
+
+	const ensureInstalled = (ctx: ExtensionContext) => {
+		if (ctx.mode !== "tui") return;
+		const ui = ctx.ui;
+		if (typeof ui.getEditorComponent !== "function" || typeof ui.setEditorComponent !== "function") {
+			return;
+		}
+
+		const previous = ui.getEditorComponent() as
+			| (((...args: any[]) => any) & { [GHOST_FACTORY_FLAG]?: boolean })
+			| undefined;
+		if (previous?.[GHOST_FACTORY_FLAG]) {
+			return;
+		}
+
+		const factory = ((tui, theme, keybindings) => {
+			activeTui = tui;
+			const editor = (
+				previous ? previous(tui, theme, keybindings) : new CustomEditor(tui, theme, keybindings)
+			) as WrappableEditor;
+
+			// Guard against double-patching when another wrapping extension sits between us and the base editor.
+			if (!editor || editor[GHOST_INSTANCE_FLAG] || typeof editor.render !== "function" || typeof editor.handleInput !== "function") {
+				return editor as any;
+			}
+			editor[GHOST_INSTANCE_FLAG] = true;
+
+			const originalRender = editor.render.bind(editor);
+			editor.render = (width: number) => {
+				const lines = originalRender(width);
+				if (
+					!ghostText ||
+					!Array.isArray(lines) ||
+					lines.length < 2 ||
+					editor.getText().length > 0 ||
+					editor.isShowingAutocomplete?.()
+				) {
+					return lines;
+				}
+
+				const nextLines = [...lines];
+				nextLines[1] = injectGhostTextIntoLine(nextLines[1], ghostText, editor.paddingX ?? 0, {
+					truncateToWidth,
+					visibleWidth,
+					styleDim: (text) => ctx.ui.theme.fg("dim", text),
+				});
+				return nextLines;
+			};
+
+			const originalHandleInput = editor.handleInput.bind(editor);
+			editor.handleInput = (data: string) => {
+				const isEmpty = editor.getText().length === 0;
+				const showingAutocomplete = Boolean(editor.isShowingAutocomplete?.());
+
+				if (ghostText && isEmpty && !showingAutocomplete) {
+					if (matchesKey(data, "tab") || matchesKey(data, "right")) {
+						const accepted = ghostText;
+						ghostText = "";
+						editor.setText(accepted);
+						tui.requestRender();
+						return;
+					}
+					if (matchesKey(data, "escape")) {
+						ghostText = "";
+						tui.requestRender();
+						return;
+					}
+				}
+
+				originalHandleInput(data);
+
+				if (editor.getText().length > 0) {
+					const hadGhost = ghostText.length > 0;
+					ghostText = "";
+					onUserEdit();
+					if (hadGhost) tui.requestRender();
+				}
+			};
+
+			return editor as any;
+		}) as Parameters<ExtensionContext["ui"]["setEditorComponent"]>[0] & { [GHOST_FACTORY_FLAG]?: boolean };
+
+		factory[GHOST_FACTORY_FLAG] = true;
+		try {
+			ui.setEditorComponent(factory);
+		} catch {
+			// Ignore in non-interactive modes.
+		}
+	};
+
+	return {
+		ensureInstalled,
+		setGhostText,
+		clearGhostText,
+		getGhostText: () => ghostText,
+		reset: () => {
+			ghostText = "";
+			activeTui = undefined;
+		},
+	};
+}

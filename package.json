@@ -1,0 +1,32 @@
+{
+  "name": "pi-nexp",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Predict the next user prompt as inline ghost text in Pi coding agent",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "prompt-prediction",
+    "ghost-text",
+    "tui"
+  ],
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.ts\""
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
