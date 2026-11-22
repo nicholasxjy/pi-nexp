@@ -55,3 +55,5 @@ Omit `model` (or set it to `null`) to follow the main session's current model.
 ```bash
 npm test
 ```
+
+With Pi 1.6 and Python 3 on macOS or Linux, run `python3 test/startup-focus.py` to check that the editor receives input after a startup overlay closes.

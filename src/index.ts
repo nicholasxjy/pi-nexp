@@ -82,7 +82,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// Re-verify wrapper before showing ghost text in case another extension replaced the editor after session_start.
+		// Defer editor replacement until prediction so startup overlays can restore focus to the original editor.
 		ghostEditor.ensureInstalled(ctx);
 
 		abortInFlight(ctx);
@@ -132,7 +132,6 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		clearAll(ctx);
-		ghostEditor.ensureInstalled(ctx);
 	});
 
 	pi.on("session_tree", (_event, ctx) => {
