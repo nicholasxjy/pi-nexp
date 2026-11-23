@@ -23,7 +23,7 @@ interface WrappableEditor {
 	isShowingAutocomplete?(): boolean;
 }
 
-export function createGhostEditorController(onUserEdit: () => void): GhostEditorController {
+export function createGhostEditorController(onCancelPrediction: () => boolean): GhostEditorController {
 	let ghostText = "";
 	let activeTui: TUI | undefined;
 
@@ -94,31 +94,44 @@ export function createGhostEditorController(onUserEdit: () => void): GhostEditor
 
 			const originalHandleInput = editor.handleInput.bind(editor);
 			editor.handleInput = (data: string) => {
-				const isEmpty = editor.getText().length === 0;
+				const beforeText = editor.getText();
+				const isEmpty = beforeText.length === 0;
 				const showingAutocomplete = Boolean(editor.isShowingAutocomplete?.());
 
-				if (ghostText && isEmpty && !showingAutocomplete) {
-					if (matchesKey(data, "tab") || matchesKey(data, "right")) {
-						const accepted = ghostText;
-						ghostText = "";
-						editor.setText(accepted);
-						tui.requestRender();
+				if (ghostText && isEmpty && !showingAutocomplete && (matchesKey(data, "tab") || matchesKey(data, "right"))) {
+					const accepted = ghostText;
+					ghostText = "";
+					editor.setText(accepted);
+					tui.requestRender();
+					return;
+				}
+
+				if (matchesKey(data, "escape")) {
+					const hadVisibleGhost = ghostText.length > 0 && isEmpty && !showingAutocomplete;
+					const hadGhost = ghostText.length > 0;
+					const canceledPending = Boolean(onCancelPrediction());
+					ghostText = "";
+
+					if (!showingAutocomplete && (hadVisibleGhost || canceledPending)) {
+						if (hadGhost) tui.requestRender();
 						return;
 					}
-					if (matchesKey(data, "escape")) {
-						ghostText = "";
-						tui.requestRender();
-						return;
-					}
+
+					originalHandleInput(data);
+					if (hadGhost) tui.requestRender();
+					return;
 				}
 
 				originalHandleInput(data);
 
-				if (editor.getText().length > 0) {
-					const hadGhost = ghostText.length > 0;
-					ghostText = "";
-					onUserEdit();
-					if (hadGhost) tui.requestRender();
+				const afterText = editor.getText();
+				const afterEmpty = afterText.length === 0;
+				const afterAutocomplete = Boolean(editor.isShowingAutocomplete?.());
+				if (afterText !== beforeText) {
+					onCancelPrediction();
+				}
+				if (ghostText && (isEmpty !== afterEmpty || showingAutocomplete !== afterAutocomplete)) {
+					tui.requestRender();
 				}
 			};
 

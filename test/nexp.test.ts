@@ -7,8 +7,9 @@ import { DEFAULT_CONFIG, loadConfig, parseModelSpec, saveConfigPatch } from "../
 import {
 	buildConversationTranscript,
 	cleanPredictionOutput,
+	MAX_PREDICTION_CHARS,
 	shouldSkipAutoPredict,
-	type SessionEntryLike,
+	type MessageLike,
 } from "../src/context.ts";
 import { FAKE_CURSOR_END, injectGhostTextIntoLine } from "../src/ghost-render.ts";
 import { predictNextPrompt, resolvePredictionModel, resolveReasoningOption } from "../src/predictor.ts";
@@ -71,69 +72,95 @@ describe("config", () => {
 });
 
 describe("context derivation and output cleaning", () => {
-	it("skips auto-predict on aborted, error, or empty branches", () => {
-		const okBranch: SessionEntryLike[] = [
-			{ type: "message", message: { role: "user", content: "hi" } },
-			{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "hello" }], stopReason: "stop" } },
+	it("skips auto-predict on aborted, error, or empty conversations", () => {
+		const messages: MessageLike[] = [
+			{ role: "user", content: "hi" },
+			{ role: "assistant", content: [{ type: "text", text: "hello" }], stopReason: "stop" },
 		];
 		assert.equal(shouldSkipAutoPredict([], false), true);
-		assert.equal(shouldSkipAutoPredict(okBranch, true), true);
-		assert.equal(shouldSkipAutoPredict(okBranch, false), false);
+		assert.equal(shouldSkipAutoPredict([{ role: "branchSummary", summary: "  " }], false), true);
+		assert.equal(shouldSkipAutoPredict(messages, true), true);
+		assert.equal(shouldSkipAutoPredict(messages, false), false);
 		assert.equal(
-			shouldSkipAutoPredict(
-				[
-					...okBranch,
-					{ type: "message", message: { role: "assistant", content: [], stopReason: "error" } },
-				],
-				false,
-			),
+			shouldSkipAutoPredict([...messages, { role: "assistant", content: [], stopReason: "error" }], false),
 			true,
 		);
 	});
 
-	it("truncates long tool results, skips thinking blocks, and keeps newest turns within budget", () => {
-		const longOutput = "x".repeat(1000);
-		const branch: SessionEntryLike[] = [
-			{ type: "message", message: { role: "user", content: "Old turn 1" } },
-			{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "Old reply 1" }] } },
-			{ type: "compaction", summary: "Compacted earlier summary" },
-			{ type: "message", message: { role: "user", content: "Fix the failing parser test" } },
-			{
-				type: "message",
-				message: {
-					role: "assistant",
-					content: [
-						{ type: "thinking", text: "secret internal chain of thought" },
-						{ type: "toolCall", name: "bash", arguments: { command: "npm test" } },
-					],
-				},
-			},
-			{
-				type: "message",
-				message: {
-					role: "toolResult",
-					toolName: "bash",
-					isError: true,
-					content: [{ type: "text", text: longOutput }],
-				},
-			},
-			{
-				type: "message",
-				message: {
-					role: "assistant",
-					content: [{ type: "text", text: "Fixed the parser bug in src/parser.ts." }],
-				},
-			},
+	it("keeps the newest six user turns alongside leading summaries, with a limit on each summary", () => {
+		const turns = [0, 1, 2, 3, 4, 5, 6];
+		const messages: MessageLike[] = [
+			{ role: "compactionSummary", summary: `Compacted history ${"c".repeat(1300)}` },
+			{ role: "branchSummary", summary: `Previous branch ${"b".repeat(1300)}` },
+			...turns.flatMap((turn) => [
+				{ role: "user", content: `Request ${turn}` },
+				{ role: "assistant", content: [{ type: "text", text: `Reply ${turn}` }] },
+			]),
 		];
 
-		const transcript = buildConversationTranscript(branch, 2000);
-		assert.doesNotMatch(transcript, /Old turn 1/);
-		assert.doesNotMatch(transcript, /secret internal chain of thought/);
-		assert.match(transcript, /Summary \(earlier conversation\): Compacted earlier summary/);
+		const transcript = buildConversationTranscript(messages, 8000);
+		assert.deepEqual(
+			transcript.match(/^(User: Request|Assistant: Reply) \d$/gm),
+			turns.slice(1).flatMap((turn) => [`User: Request ${turn}`, `Assistant: Reply ${turn}`]),
+		);
+		for (const start of ["Compacted history", "Previous branch"]) {
+			const line = transcript.split("\n").find((line) => line.includes(start));
+			assert.ok(line, `Expected ${start} in the transcript`);
+			assert.equal(line.slice(line.indexOf(start)).length, 1200);
+			assert.match(line, /\[truncated\]/);
+		}
+	});
+
+	it("truncates long tool results, skips thinking blocks, and keeps the newest request and reply within budget", () => {
+		const messages: MessageLike[] = [
+			{ role: "user", content: "Old request" },
+			{ role: "assistant", content: [{ type: "text", text: "Old reply" }] },
+			{ role: "user", content: "Fix the failing parser test" },
+			{
+				role: "assistant",
+				content: [
+					{ type: "thinking", text: "private reasoning" },
+					{ type: "toolCall", name: "bash", arguments: { command: "npm test" } },
+				],
+			},
+			{
+				role: "toolResult",
+				toolName: "bash",
+				isError: true,
+				content: [{ type: "text", text: "x".repeat(1000) }],
+			},
+			{ role: "assistant", content: [{ type: "text", text: "Fixed the parser bug in src/parser.ts." }] },
+		];
+
+		const transcript = buildConversationTranscript(messages, 2000);
+		assert.doesNotMatch(transcript, /private reasoning/);
 		assert.match(transcript, /ToolCall bash\(/);
 		assert.match(transcript, /ToolResult bash \(error\): .*\[truncated\]/);
-		assert.match(transcript, /Fixed the parser bug/);
-		assert.ok(transcript.length <= 2000);
+
+		const budget = 160;
+		const shortened = buildConversationTranscript(messages, budget);
+		assert.ok(shortened.length <= budget);
+		assert.match(shortened, /^User: Fix the failing parser test/);
+		assert.match(shortened, /Fixed the parser bug in src\/parser\.ts\.$/);
+		assert.doesNotMatch(shortened, /Old request|Old reply/);
+	});
+
+	it("prioritizes the latest request and reply over a trailing branch summary", () => {
+		for (const conversation of [
+			[
+				{ role: "user", content: `LATEST_REQUEST ${"u".repeat(600)}` },
+				{ role: "assistant", content: `Completed ${"a".repeat(600)} TESTS_PASSED_42` },
+			],
+			[{ role: "assistant", content: `Completed ${"a".repeat(600)} TESTS_PASSED_42` }],
+		]) {
+			const transcript = buildConversationTranscript([
+				...conversation,
+				{ role: "branchSummary", summary: "b".repeat(1200) },
+			], 1000);
+			assert.ok(transcript.length <= 1000);
+			assert.match(transcript, /TESTS_PASSED_42$/);
+			if (conversation[0].role === "user") assert.match(transcript, /^User: LATEST_REQUEST/);
+		}
 	});
 
 	it("cleans quotes, code fences, prefixes, and trailing commentary", () => {
@@ -141,6 +168,15 @@ describe("context derivation and output cleaning", () => {
 		assert.equal(cleanPredictionOutput("```text\nNext prompt: 提交当前修改\n```"), "提交当前修改");
 		assert.equal(cleanPredictionOutput("运行测试验证修复\n\n因为刚才改了核心逻辑"), "运行测试验证修复");
 		assert.equal(cleanPredictionOutput("   "), "");
+	});
+
+	it("accepts 100 Unicode code points after cleanup and rejects 101", () => {
+		assert.equal(MAX_PREDICTION_CHARS, 100);
+		for (const character of ["a", "测", "🚀"]) {
+			const exact = character.repeat(100);
+			assert.equal(cleanPredictionOutput(`Next prompt: “${exact}”\n\nIgnored commentary`), exact);
+			assert.equal(cleanPredictionOutput(exact + character), "");
+		}
 	});
 });
 
@@ -176,15 +212,15 @@ describe("predictor", () => {
 			},
 		};
 
-		const branch: SessionEntryLike[] = [
-			{ type: "message", message: { role: "user", content: "实现配置模块" } },
-			{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "已完成 config.ts" }] } },
+		const messages: MessageLike[] = [
+			{ role: "user", content: "实现配置模块" },
+			{ role: "assistant", content: [{ type: "text", text: "已完成 config.ts" }] },
 		];
 
 		// Case 1: thinking enabled on reasoning model -> passes reasoning, omits maxTokens cap.
 		const res1 = await predictNextPrompt({
 			config: { enabled: true, model: "openai/gpt-5-mini", thinkingLevel: "low", maxContextChars: 8000 },
-			branch,
+			messages,
 			cwd: "/tmp/demo",
 			registry,
 			activeModel: nonReasoningModel,
@@ -200,7 +236,7 @@ describe("predictor", () => {
 		// Case 2: follow main non-reasoning model with thinkingLevel=high -> degrades reasoning and sets maxTokens.
 		const res2 = await predictNextPrompt({
 			config: { enabled: true, thinkingLevel: "high", maxContextChars: 8000 },
-			branch,
+			messages,
 			cwd: "/tmp/demo",
 			registry,
 			activeModel: nonReasoningModel,

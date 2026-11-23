@@ -43,20 +43,23 @@ export default function (pi: ExtensionAPI) {
 	let requestSeq = 0;
 	let latestCtx: ExtensionContext | undefined;
 
-	const abortInFlight = (ctx?: ExtensionContext) => {
+	const abortInFlight = (ctx?: ExtensionContext): boolean => {
+		const hadInFlight = inFlight !== undefined;
 		if (inFlight) {
 			inFlight.abort();
 			inFlight = undefined;
 		}
-		const target = ctx ?? latestCtx;
-		if (target?.mode === "tui") {
-			target.ui.setStatus(STATUS_KEY, undefined);
+		requestSeq += 1;
+		if (hadInFlight || ctx) {
+			const target = ctx ?? latestCtx;
+			if (target?.mode === "tui") {
+				target.ui.setStatus(STATUS_KEY, undefined);
+			}
 		}
+		return hadInFlight;
 	};
 
-	const ghostEditor = createGhostEditorController(() => {
-		abortInFlight();
-	});
+	const ghostEditor = createGhostEditorController(() => abortInFlight());
 
 	const clearAll = (ctx?: ExtensionContext) => {
 		abortInFlight(ctx);
@@ -97,7 +100,7 @@ export default function (pi: ExtensionAPI) {
 
 		const result = await predictNextPrompt({
 			config,
-			branch: ctx.sessionManager.getBranch(),
+			messages: ctx.sessionManager.buildSessionProjection().messages,
 			cwd: ctx.cwd,
 			registry: ctx.modelRegistry as any,
 			activeModel: ctx.model,
@@ -105,7 +108,7 @@ export default function (pi: ExtensionAPI) {
 			createSessionId: uuidv7,
 		});
 
-		if (seq !== requestSeq) return;
+		if (seq !== requestSeq || controller.signal.aborted) return;
 		if (inFlight === controller) {
 			inFlight = undefined;
 		}
@@ -138,6 +141,10 @@ export default function (pi: ExtensionAPI) {
 		clearAll(ctx);
 	});
 
+	pi.on("session_compact", (_event, ctx) => {
+		clearAll(ctx);
+	});
+
 	pi.on("session_shutdown", (_event, ctx) => {
 		abortInFlight(ctx);
 		ghostEditor.reset();
@@ -152,7 +159,7 @@ export default function (pi: ExtensionAPI) {
 		const config = loadConfig(ctx.cwd);
 		if (!config.enabled) return;
 		if (ctx.ui.getEditorText().length > 0) return;
-		if (shouldSkipAutoPredict(ctx.sessionManager.getBranch(), event.aborted)) return;
+		if (shouldSkipAutoPredict(ctx.sessionManager.buildSessionProjection().messages, event.aborted)) return;
 
 		void runPrediction(ctx, false);
 	});

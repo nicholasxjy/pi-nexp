@@ -8,21 +8,17 @@ export interface ContentBlockLike {
 export interface MessageLike {
 	role?: string;
 	content?: unknown;
+	summary?: string;
 	toolName?: string;
 	isError?: boolean;
 	stopReason?: string;
 }
 
-export interface SessionEntryLike {
-	type: string;
-	summary?: string;
-	message?: MessageLike;
-}
-
 export const MAX_RECENT_TURNS = 6;
+export const MAX_PREDICTION_CHARS = 100;
 const MAX_TOOL_ARGS_CHARS = 140;
 const MAX_TOOL_RESULT_CHARS = 400;
-const MAX_COMPACTION_SUMMARY_CHARS = 1200;
+const MAX_SUMMARY_CHARS = 1200;
 
 export const PREDICTION_SYSTEM_PROMPT = [
 	"You predict the user's single most likely next prompt in a coding-agent conversation.",
@@ -30,7 +26,7 @@ export const PREDICTION_SYSTEM_PROMPT = [
 	"- Output ONLY the raw predicted user prompt text.",
 	"- No explanations, no preamble, no surrounding quotes, no markdown fences, no bullet list.",
 	"- Write in the same language as the user's most recent message.",
-	"- Keep it concise, concrete, and actionable (usually one short sentence).",
+	`- Keep it concise, concrete, and actionable (usually one short sentence, at most ${MAX_PREDICTION_CHARS} characters).`,
 	"- Predict what the user will actually type next (for example: run tests, fix an issue, inspect a file, proceed to the next step, commit), NOT an assistant reply.",
 	"- If there is no clear next prompt to suggest, output an empty string.",
 ].join("\n");
@@ -115,27 +111,48 @@ function formatMessageEntry(message: MessageLike): string | null {
 		return `ToolResult ${name}${status}: ${body}`;
 	}
 
+	if (role === "compactionSummary") {
+		if (typeof message.summary !== "string" || !message.summary.trim()) return null;
+		return `Summary (earlier conversation): ${truncateMiddleOrEnd(message.summary, MAX_SUMMARY_CHARS)}`;
+	}
+
+	if (role === "branchSummary") {
+		if (typeof message.summary !== "string" || !message.summary.trim()) return null;
+		return `Summary (branch): ${truncateMiddleOrEnd(message.summary, MAX_SUMMARY_CHARS)}`;
+	}
+
+	if (role === "custom") {
+		const { text, imageCount } = extractText(message.content);
+		const suffix = imageCount > 0 ? (text ? `\n[${imageCount} image(s)]` : `[${imageCount} image(s)]`) : "";
+		const combined = `${text}${suffix}`.trim();
+		return combined ? `Context: ${combined}` : null;
+	}
+
 	return null;
 }
 
 /**
  * Determine whether automatic prediction after agent_settled should be skipped.
- * Skips aborted runs, error endings, and branches with no conversation messages.
+ * Skips aborted runs, error endings, and projections with no conversation messages.
  */
-export function shouldSkipAutoPredict(branch: readonly SessionEntryLike[], aborted: boolean): boolean {
+export function shouldSkipAutoPredict(messages: readonly MessageLike[], aborted: boolean): boolean {
 	if (aborted) return true;
 
 	let hasConversationMessage = false;
 	let lastAssistant: MessageLike | undefined;
 
-	for (const entry of branch) {
-		if (entry.type !== "message" || !entry.message) continue;
-		const role = entry.message.role;
-		if (role === "user" || role === "assistant") {
+	for (const message of messages) {
+		if (!message) continue;
+		const role = message.role;
+		if (
+			role === "user" || role === "assistant" ||
+			((role === "compactionSummary" || role === "branchSummary") &&
+				typeof message.summary === "string" && message.summary.trim().length > 0)
+		) {
 			hasConversationMessage = true;
 		}
 		if (role === "assistant") {
-			lastAssistant = entry.message;
+			lastAssistant = message;
 		}
 	}
 
@@ -174,37 +191,31 @@ function fitToCharBudget(turns: string[], maxChars: number): string {
 }
 
 export function buildConversationTranscript(
-	branch: readonly SessionEntryLike[],
+	messages: readonly MessageLike[],
 	maxContextChars: number,
 	maxTurns = MAX_RECENT_TURNS,
 ): string {
-	// Start from the latest compaction entry if present so pre-compaction noise is excluded.
-	let startIndex = 0;
-	let compactionSummary: string | undefined;
-	for (let i = branch.length - 1; i >= 0; i -= 1) {
-		if (branch[i]?.type === "compaction") {
-			startIndex = i + 1;
-			if (typeof branch[i].summary === "string" && branch[i].summary.trim()) {
-				compactionSummary = truncateMiddleOrEnd(branch[i].summary, MAX_COMPACTION_SUMMARY_CHARS);
-			}
-			break;
-		}
-	}
-
+	const summaries: string[] = [];
+	const preamble: string[] = [];
 	const turns: string[][] = [];
 	let currentTurn: string[] = [];
 
-	for (let i = startIndex; i < branch.length; i += 1) {
-		const entry = branch[i];
-		if (!entry || entry.type !== "message" || !entry.message) continue;
-		const formatted = formatMessageEntry(entry.message);
+	for (const message of messages) {
+		if (!message) continue;
+		const formatted = formatMessageEntry(message);
 		if (!formatted) continue;
 
-		if (entry.message.role === "user" && currentTurn.length > 0) {
-			turns.push(currentTurn);
+		if (message.role === "compactionSummary" || message.role === "branchSummary") {
+			summaries.push(formatted);
+		} else if (message.role === "user") {
+			if (currentTurn.length > 0) {
+				turns.push(currentTurn);
+			}
 			currentTurn = [formatted];
-		} else {
+		} else if (currentTurn.length > 0) {
 			currentTurn.push(formatted);
+		} else {
+			preamble.push(formatted);
 		}
 	}
 
@@ -212,13 +223,12 @@ export function buildConversationTranscript(
 		turns.push(currentTurn);
 	}
 
-	const recentTurns = turns.slice(-maxTurns).map((parts) => parts.join("\n"));
-	if (compactionSummary && recentTurns.length < maxTurns) {
-		recentTurns.unshift(`Summary (earlier conversation): ${compactionSummary}`);
-	}
+	const recentTurns = (maxTurns > 0 ? turns.slice(-maxTurns) : []).map((parts) => parts.join("\n"));
+	// Summaries are background context; spend the budget on recent dialogue first.
+	const segments = [...summaries, ...(preamble.length > 0 ? [preamble.join("\n")] : []), ...recentTurns];
 
-	if (recentTurns.length === 0) return "";
-	return fitToCharBudget(recentTurns, maxContextChars);
+	if (segments.length === 0) return "";
+	return fitToCharBudget(segments, maxContextChars);
 }
 
 export function buildPredictionUserPrompt(transcript: string, cwd: string): string {
@@ -266,6 +276,11 @@ export function cleanPredictionOutput(rawText: string): string {
 			(text.startsWith("“") && text.endsWith("”")))
 	) {
 		text = text.slice(1, -1).trim();
+	}
+
+	text = text.trim();
+	if (!text || Array.from(text).length > MAX_PREDICTION_CHARS) {
+		return "";
 	}
 
 	return text;

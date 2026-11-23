@@ -6,7 +6,7 @@ import {
 	buildPredictionUserPrompt,
 	cleanPredictionOutput,
 	PREDICTION_SYSTEM_PROMPT,
-	type SessionEntryLike,
+	type MessageLike,
 } from "./context.ts";
 
 export interface ModelLike {
@@ -92,7 +92,7 @@ export function resolveReasoningOption(
 
 export interface PredictOptions {
 	config: NexpConfig;
-	branch: readonly SessionEntryLike[];
+	messages: readonly MessageLike[];
 	cwd: string;
 	registry: ModelRegistryLike;
 	activeModel: ModelLike | undefined;
@@ -105,7 +105,7 @@ export type PredictResult =
 	| { ok: false; aborted?: boolean; error: string };
 
 export async function predictNextPrompt(opts: PredictOptions): Promise<PredictResult> {
-	const transcript = buildConversationTranscript(opts.branch, opts.config.maxContextChars);
+	const transcript = buildConversationTranscript(opts.messages, opts.config.maxContextChars);
 	if (!transcript) {
 		return { ok: false, error: "No conversation history to predict from" };
 	}
