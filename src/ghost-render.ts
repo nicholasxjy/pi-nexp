@@ -6,10 +6,14 @@ export interface GhostRenderDeps {
 	styleDim: (text: string) => string;
 }
 
+const TRAILING_ANSI_ONLY = /^(?:\x1b\[[0-9;]*m|\x1b_[^\x07]*\x07)*$/;
+const TRAILING_BORDER_OR_RESET = /^(?:\x1b\[[0-9;]*m)*[│┃║▕\]](?:\x1b\[[0-9;]*m)* *$/;
+
 /**
  * Inject single-line dim ghost text right after pi-tui's fake cursor marker on an empty editor line.
  * Preserves CURSOR_MARKER, FAKE_CURSOR markers (hardware & software cursor), left prompt prefixes
- * (e.g. pi-cc-tools `❯ `), right padding, and the exact rendered visible line width.
+ * (e.g. pi-cc-tools `❯ `), trailing ANSI resets or right borders, right padding, and the exact
+ * rendered visible line width.
  */
 export function injectGhostTextIntoLine(
 	line: string,
@@ -27,11 +31,17 @@ export function injectGhostTextIntoLine(
 	const before = line.slice(0, splitAt);
 	const after = line.slice(splitAt);
 
-	// The portion after FAKE_CURSOR_END on an empty editor line must be trailing spaces.
-	if (!/^ +$/.test(after)) return line;
+	const spaceMatch = after.match(/^( +)([\s\S]*)$/);
+	if (!spaceMatch) return line;
 
-	const safeRightPad = Math.max(0, Math.min(rightPaddingCols, after.length - 1));
-	const availableWidth = after.length - safeRightPad;
+	const leadingSpaces = spaceMatch[1];
+	const trailing = spaceMatch[2];
+	if (trailing && !TRAILING_ANSI_ONLY.test(trailing) && !TRAILING_BORDER_OR_RESET.test(trailing)) {
+		return line;
+	}
+
+	const safeRightPad = Math.max(0, Math.min(rightPaddingCols, leadingSpaces.length - 1));
+	const availableWidth = leadingSpaces.length - safeRightPad;
 	if (availableWidth <= 0) return line;
 
 	const truncated = deps.truncateToWidth(singleLine, availableWidth, "…");
@@ -39,6 +49,7 @@ export function injectGhostTextIntoLine(
 
 	const styled = deps.styleDim(truncated);
 	const usedWidth = deps.visibleWidth(styled);
-	const remainingSpaces = Math.max(0, after.length - usedWidth);
-	return `${before}${styled}${" ".repeat(remainingSpaces)}`;
+	if (usedWidth > leadingSpaces.length) return line;
+	const remainingSpaces = leadingSpaces.length - usedWidth;
+	return `${before}${styled}${" ".repeat(remainingSpaces)}${trailing}`;
 }

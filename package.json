@@ -22,7 +22,11 @@
     ]
   },
   "scripts": {
-    "test": "node --test \"test/*.test.ts\""
+    "test": "node --test \"test/*.test.ts\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

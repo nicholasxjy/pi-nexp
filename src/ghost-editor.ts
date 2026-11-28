@@ -1,21 +1,29 @@
 import { CustomEditor, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth, type TUI } from "@earendil-works/pi-tui";
-import { injectGhostTextIntoLine } from "./ghost-render.ts";
+import { FAKE_CURSOR_END, injectGhostTextIntoLine } from "./ghost-render.ts";
 
 const GHOST_FACTORY_FLAG = Symbol.for("pi-nexp:ghost-editor-factory");
 const GHOST_INSTANCE_FLAG = Symbol.for("pi-nexp:ghost-editor-instance");
 
 export interface GhostEditorController {
 	ensureInstalled(ctx: ExtensionContext): void;
+	updateContext(ctx: ExtensionContext): void;
 	setGhostText(text: string): void;
 	clearGhostText(): void;
 	getGhostText(): string;
 	reset(): void;
 }
 
+export interface GhostEditorCallbacks {
+	onCancelPrediction: () => boolean;
+	onAcceptGhost?: () => void;
+	onDismissGhost?: () => void;
+}
+
 interface WrappableEditor {
 	[GHOST_INSTANCE_FLAG]?: boolean;
 	paddingX?: number;
+	getPaddingX?(): number;
 	render(width: number): string[];
 	handleInput(data: string): void;
 	getText(): string;
@@ -23,9 +31,15 @@ interface WrappableEditor {
 	isShowingAutocomplete?(): boolean;
 }
 
-export function createGhostEditorController(onCancelPrediction: () => boolean): GhostEditorController {
+export function createGhostEditorController(
+	callbacksOrCancel: GhostEditorCallbacks | (() => boolean),
+): GhostEditorController {
+	const callbacks: GhostEditorCallbacks =
+		typeof callbacksOrCancel === "function" ? { onCancelPrediction: callbacksOrCancel } : callbacksOrCancel;
+
 	let ghostText = "";
 	let activeTui: TUI | undefined;
+	let currentCtx: ExtensionContext | undefined;
 
 	const requestRender = () => {
 		activeTui?.requestRender();
@@ -44,7 +58,12 @@ export function createGhostEditorController(onCancelPrediction: () => boolean): 
 		requestRender();
 	};
 
+	const updateContext = (ctx: ExtensionContext) => {
+		currentCtx = ctx;
+	};
+
 	const ensureInstalled = (ctx: ExtensionContext) => {
+		currentCtx = ctx;
 		if (ctx.mode !== "tui") return;
 		const ui = ctx.ui;
 		if (typeof ui.getEditorComponent !== "function" || typeof ui.setEditorComponent !== "function") {
@@ -76,18 +95,24 @@ export function createGhostEditorController(onCancelPrediction: () => boolean): 
 				if (
 					!ghostText ||
 					!Array.isArray(lines) ||
-					lines.length < 2 ||
+					lines.length === 0 ||
 					editor.getText().length > 0 ||
 					editor.isShowingAutocomplete?.()
 				) {
 					return lines;
 				}
 
+				const lineIndex = lines.findIndex((line) => line.includes(FAKE_CURSOR_END));
+				if (lineIndex === -1) {
+					return lines;
+				}
+
+				const paddingX = typeof editor.getPaddingX === "function" ? editor.getPaddingX() : (editor.paddingX ?? 0);
 				const nextLines = [...lines];
-				nextLines[1] = injectGhostTextIntoLine(nextLines[1], ghostText, editor.paddingX ?? 0, {
+				nextLines[lineIndex] = injectGhostTextIntoLine(nextLines[lineIndex], ghostText, paddingX, {
 					truncateToWidth,
 					visibleWidth,
-					styleDim: (text) => ctx.ui.theme.fg("dim", text),
+					styleDim: (text) => (currentCtx ?? ctx).ui.theme.fg("dim", text),
 				});
 				return nextLines;
 			};
@@ -102,6 +127,7 @@ export function createGhostEditorController(onCancelPrediction: () => boolean): 
 					const accepted = ghostText;
 					ghostText = "";
 					editor.setText(accepted);
+					callbacks.onAcceptGhost?.();
 					tui.requestRender();
 					return;
 				}
@@ -109,8 +135,11 @@ export function createGhostEditorController(onCancelPrediction: () => boolean): 
 				if (matchesKey(data, "escape")) {
 					const hadVisibleGhost = ghostText.length > 0 && isEmpty && !showingAutocomplete;
 					const hadGhost = ghostText.length > 0;
-					const canceledPending = Boolean(onCancelPrediction());
+					const canceledPending = Boolean(callbacks.onCancelPrediction());
 					ghostText = "";
+					if (hadGhost) {
+						callbacks.onDismissGhost?.();
+					}
 
 					if (!showingAutocomplete && (hadVisibleGhost || canceledPending)) {
 						if (hadGhost) tui.requestRender();
@@ -128,7 +157,7 @@ export function createGhostEditorController(onCancelPrediction: () => boolean): 
 				const afterEmpty = afterText.length === 0;
 				const afterAutocomplete = Boolean(editor.isShowingAutocomplete?.());
 				if (afterText !== beforeText) {
-					onCancelPrediction();
+					callbacks.onCancelPrediction();
 				}
 				if (ghostText && (isEmpty !== afterEmpty || showingAutocomplete !== afterAutocomplete)) {
 					tui.requestRender();
@@ -148,12 +177,14 @@ export function createGhostEditorController(onCancelPrediction: () => boolean): 
 
 	return {
 		ensureInstalled,
+		updateContext,
 		setGhostText,
 		clearGhostText,
 		getGhostText: () => ghostText,
 		reset: () => {
 			ghostText = "";
 			activeTui = undefined;
+			currentCtx = undefined;
 		},
 	};
 }
